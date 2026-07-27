@@ -1,8 +1,8 @@
 import os
 import random
 import threading
-from typing import List
-from urllib.parse import urlencode
+from typing import Callable, List
+from urllib.parse import quote_plus, urlencode
 
 import requests
 from loguru import logger
@@ -10,6 +10,7 @@ from moviepy.video.io.VideoFileClip import VideoFileClip
 
 from app.config import config
 from app.models.schema import MaterialInfo, VideoAspect, VideoConcatMode
+from app.services import material_cache
 from app.utils import utils
 
 # Thread-safe counter for API key rotation
@@ -50,6 +51,45 @@ def get_api_key(cfg_key: str):
     with _api_key_lock:
         _api_key_counter += 1
         return api_keys[_api_key_counter % len(api_keys)]
+
+
+def _redact_secret(message: str, secret: str) -> str:
+    """
+    对即将写入日志的异常文本做最小范围脱敏。
+
+    requests 的连接异常可能包含完整请求 URL，而 Pixabay API Key 通过查询
+    参数传递。这里同时替换原始值和 URL 编码值，既保留网络错误信息用于排查，
+    又避免密钥进入日志文件。
+    """
+    safe_message = str(message)
+    if not secret:
+        return safe_message
+
+    safe_message = safe_message.replace(secret, "***")
+    encoded_secret = quote_plus(secret)
+    if encoded_secret != secret:
+        safe_message = safe_message.replace(encoded_secret, "***")
+    return safe_message
+
+
+def _is_cloudflare_challenge(response: requests.Response) -> bool:
+    """
+    识别 Cloudflare 返回的 HTML Challenge，而不是把它当成 Pixabay JSON。
+
+    Cloudflare 通常会设置 `cf-mitigated: challenge`；部分部署只返回带有
+    "Just a moment" 或 challenge-platform 的 HTML，因此保留内容特征兜底。
+    响应正文仅在内存中判断，不写入日志，避免记录无价值的大段 HTML。
+    """
+    headers = getattr(response, "headers", {}) or {}
+    if str(headers.get("cf-mitigated", "")).lower() == "challenge":
+        return True
+
+    content_type = str(headers.get("content-type", "")).lower()
+    if "text/html" not in content_type:
+        return False
+
+    body = str(getattr(response, "text", "")).lower()
+    return "just a moment" in body or "/cdn-cgi/challenge-platform/" in body
 
 
 def search_videos_pexels(
@@ -129,14 +169,50 @@ def search_videos_pixabay(
     query_url = f"https://pixabay.com/api/videos/?{urlencode(params)}"
     logger.info(
         f"searching videos on pixabay: term={search_term!r}, "
-        f"with proxies: {config.proxy}"
+        f"proxy_enabled={bool(config.proxy)}"
     )
 
     try:
         r = requests.get(
             query_url, proxies=config.proxy, verify=_get_tls_verify(), timeout=(30, 60)
         )
-        response = r.json()
+        status_code = int(getattr(r, "status_code", 200))
+        headers = getattr(r, "headers", {}) or {}
+        content_type = str(headers.get("content-type", ""))
+        retry_after = headers.get("retry-after")
+        cf_ray = headers.get("cf-ray")
+
+        if _is_cloudflare_challenge(r):
+            logger.error(
+                "pixabay search was blocked by a Cloudflare challenge: "
+                f"status={status_code}, cf_ray={cf_ray or 'unknown'}. "
+                "Check the server network or proxy, or use Pexels/Coverr instead."
+            )
+            return []
+
+        if status_code == 429:
+            logger.error(
+                "pixabay API rate limit exceeded: "
+                f"status=429, retry_after={retry_after or 'unknown'}"
+            )
+            return []
+
+        if status_code >= 400:
+            logger.error(
+                "pixabay search request failed: "
+                f"status={status_code}, content_type={content_type or 'unknown'}"
+            )
+            return []
+
+        try:
+            response = r.json()
+        except ValueError:
+            logger.error(
+                "pixabay returned an unexpected non-JSON response: "
+                f"status={status_code}, content_type={content_type or 'unknown'}"
+            )
+            return []
+
         video_items = []
         if "hits" not in response:
             logger.error(f"search videos failed: {response}")
@@ -163,7 +239,16 @@ def search_videos_pixabay(
                     break
         return video_items
     except Exception as e:
-        logger.error(f"search videos failed: {str(e)}")
+        error_message = _redact_secret(str(e), api_key)
+        # ProxyError 等异常可能回显完整代理 URL，其中可能包含用户名和密码。
+        # 仅替换用户实际配置的代理值，不对普通错误文本做宽泛正则处理，
+        # 避免误删 DNS、超时、证书等真正有助于排查的信息。
+        for proxy_url in config.proxy.values():
+            error_message = _redact_secret(error_message, str(proxy_url))
+        logger.error(
+            "pixabay search request failed: "
+            f"error={type(e).__name__}, detail={error_message}"
+        )
 
     return []
 
@@ -304,6 +389,70 @@ def save_video(video_url: str, save_dir: str = "") -> str:
     return ""
 
 
+def _search_videos_with_cache(
+    provider: str,
+    search_videos: Callable[..., List[MaterialInfo]],
+    search_term: str,
+    minimum_duration: int,
+    video_aspect: VideoAspect,
+) -> List[MaterialInfo]:
+    """
+    统一处理三个在线素材源的 24 小时搜索缓存。
+
+    缓存只包裹搜索 API，不改变后续视频下载与去重逻辑。远端返回空列表时不写
+    缓存，因为现有 provider 接口使用空列表同时表示“没有结果”和“请求失败”；
+    在两者尚未拆分为明确结果类型前，宁可下次重试，也不能把临时故障缓存一天。
+    """
+    cache_args = {
+        "provider": provider,
+        "search_term": search_term,
+        "minimum_duration": minimum_duration,
+        "video_aspect": video_aspect,
+    }
+
+    def load_cache_safely() -> List[MaterialInfo] | None:
+        try:
+            return material_cache.load_material_search_cache(**cache_args)
+        except Exception as exc:
+            # 缓存是可选优化，任何缓存实现异常都必须按未命中处理，不能阻断
+            # Pexels、Pixabay 或 Coverr 的正常远端搜索。
+            logger.warning(
+                "material search cache read failed, continue with remote search: "
+                f"provider={provider}, error={type(exc).__name__}, detail={exc}"
+            )
+            return None
+
+    cached_items = load_cache_safely()
+    if cached_items is not None:
+        return cached_items
+
+    cache_lock = material_cache.get_material_search_cache_lock(**cache_args)
+    with cache_lock:
+        # 等待相同搜索条件的线程完成后再次读取，避免多个 API 任务在首次缓存
+        # 未命中时同时请求远端，降低第三方接口限流和风控触发概率。
+        cached_items = load_cache_safely()
+        if cached_items is not None:
+            return cached_items
+
+        items = search_videos(
+            search_term=search_term,
+            minimum_duration=minimum_duration,
+            video_aspect=video_aspect,
+        )
+        if items:
+            try:
+                material_cache.save_material_search_cache(
+                    **cache_args,
+                    items=items,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "material search cache write failed, use remote results: "
+                    f"provider={provider}, error={type(exc).__name__}, detail={exc}"
+                )
+        return items
+
+
 def download_videos(
     task_id: str,
     search_terms: List[str],
@@ -314,11 +463,27 @@ def download_videos(
     max_clip_duration: int = 5,
     match_script_order: bool = False,
 ) -> List[str]:
-    search_videos = search_videos_pexels
+    provider = "pexels"
+    remote_search_videos = search_videos_pexels
     if source == "pixabay":
-        search_videos = search_videos_pixabay
+        provider = "pixabay"
+        remote_search_videos = search_videos_pixabay
     elif source == "coverr":
-        search_videos = search_videos_coverr
+        provider = "coverr"
+        remote_search_videos = search_videos_coverr
+
+    def search_videos(
+        search_term: str,
+        minimum_duration: int,
+        video_aspect: VideoAspect,
+    ) -> List[MaterialInfo]:
+        return _search_videos_with_cache(
+            provider=provider,
+            search_videos=remote_search_videos,
+            search_term=search_term,
+            minimum_duration=minimum_duration,
+            video_aspect=video_aspect,
+        )
 
     material_directory = config.app.get("material_directory", "").strip()
     if material_directory == "task":
