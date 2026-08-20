@@ -93,6 +93,7 @@ DEFAULT_CHATTERBOX_BASE_URL = "http://127.0.0.1:4123/v1"
 DEFAULT_CHATTERBOX_MODEL = "chatterbox"
 DEFAULT_CHATTERBOX_VOICES = ["default-Female"]
 ONBOARDING_TOUR_KEY = "mpt-onboarding-v1"
+CUSTOM_LLM_ENDPOINT_ID = "custom"
 VOICE_MODE_TTS = "tts"
 VOICE_MODE_UPLOAD = "upload"
 VOICE_MODE_NONE = "none"
@@ -176,6 +177,79 @@ def _save_runtime_config():
     if not saved:
         logger.debug("deferred WebUI config save until active task completes")
     return saved
+
+
+def _saved_ui_choice(key, options, default):
+    """读取一个持久化选择，并把旧配置或手工编辑的非法值降级为默认值。"""
+    options = list(options)
+    saved = config.ui.get(key, default)
+    numeric_default = isinstance(default, (int, float)) and not isinstance(
+        default, bool
+    )
+    # bool 是 int 的子类，``True == 1``。手工把数值选项写成 TOML
+    # 布尔值时必须拒绝，不能让它伪装成第一个数值 option。
+    if numeric_default and isinstance(saved, bool):
+        return default
+    for option in options:
+        if saved == option:
+            # 返回 options 中的真实值，顺便把 TOML 1.0 等价归一化为
+            # 整数选项 1，避免下游参数类型随配置写法漂移。
+            return option
+
+    # TOML 中的数值通常保留原类型；仍兼容用户手工写成字符串的情况。
+    if numeric_default and isinstance(saved, str):
+        try:
+            converted = type(default)(saved)
+        except (TypeError, ValueError):
+            converted = None
+        for option in options:
+            if converted == option:
+                return option
+    return default
+
+
+def _saved_ui_number(key, default, minimum, maximum, number_type=float):
+    """读取并限幅持久化数值，避免非法配置破坏 Streamlit slider。"""
+    try:
+        saved = config.ui.get(key, default)
+        if isinstance(saved, bool):
+            raise ValueError("boolean is not a numeric setting")
+        value = number_type(saved)
+        if isinstance(value, float) and not math.isfinite(value):
+            raise ValueError("non-finite value")
+    except (TypeError, ValueError, OverflowError):
+        value = default
+    return min(maximum, max(minimum, value))
+
+
+def _saved_ui_bool(key, default):
+    """兼容 TOML 布尔值和常见手工字符串，拒绝含义不明的旧值。"""
+    value = config.ui.get(key, default)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+    return default
+
+
+def _saved_ui_color(key, default):
+    """只把标准六位十六进制颜色传给 Streamlit color picker。"""
+    value = str(config.ui.get(key, default) or "").strip()
+    if re.fullmatch(r"#[0-9a-fA-F]{6}", value):
+        return value
+    return default
+
+
+def _saved_ui_text(key, default="", max_length=None):
+    """读取持久化文本并遵守对应 WebUI 控件的长度上限。"""
+    value = str(config.ui.get(key, default) or default)
+    if max_length is not None:
+        value = value[:max_length]
+    return value
 
 
 def _run_llm_read_operation(operation_name, operation):
@@ -325,10 +399,48 @@ def _initialize_session_state():
         "video_subject": "",
         "video_script": "",
         "video_terms": "",
-        "video_script_prompt": "",
-        "custom_system_prompt": llm.DEFAULT_SCRIPT_SYSTEM_PROMPT,
+        "paragraph_number_input": _saved_ui_number(
+            "paragraph_number",
+            1,
+            llm.MIN_SCRIPT_PARAGRAPH_NUMBER,
+            llm.MAX_SCRIPT_PARAGRAPH_NUMBER,
+            int,
+        ),
+        "video_script_prompt": _saved_ui_text(
+            "video_script_prompt",
+            max_length=llm.MAX_SCRIPT_PROMPT_LENGTH,
+        ),
+        "custom_system_prompt": _saved_ui_text(
+            "custom_system_prompt",
+            llm.DEFAULT_SCRIPT_SYSTEM_PROMPT,
+            llm.MAX_SCRIPT_SYSTEM_PROMPT_LENGTH,
+        ),
         "match_materials_to_script": bool(
             config.app.get("match_materials_to_script", False)
+        ),
+        "custom_bgm_file_input": _saved_ui_text("custom_bgm_file"),
+        "sonilo_bgm_prompt_input": _saved_ui_text(
+            "sonilo_bgm_prompt",
+            max_length=sonilo_service.MAX_PROMPT_LENGTH,
+        ),
+        "elevenlabs_music_prompt_input": _saved_ui_text(
+            "elevenlabs_music_prompt",
+            max_length=elevenlabs_music_service.MAX_PROMPT_LENGTH,
+        ),
+        "subtitle_enabled_checkbox": _saved_ui_bool("subtitle_enabled", True),
+        "stroke_color_picker": _saved_ui_color("stroke_color", "#000000"),
+        "stroke_width_slider": _saved_ui_number(
+            "stroke_width", 1.5, 0.0, 10.0
+        ),
+        "loomloom_candidate_count": _saved_ui_number(
+            "loomloom_candidate_count",
+            3,
+            1,
+            loomloom.MAX_SCRIPT_CANDIDATES,
+            int,
+        ),
+        "loomloom_script_duration_seconds": _saved_ui_number(
+            "loomloom_script_duration_seconds", 60, 10, 600, int
         ),
         "ui_language": initial_ui_language,
         # 已落盘的本地素材允许用户只修改文案后继续复用。
@@ -359,7 +471,13 @@ def _initialize_session_state():
         "loomloom_video_client_request_id": "",
         "loomloom_video_confirm_charge": False,
         # AI 视频按素材段计费，默认只生成一段，用户确认效果后再主动增加数量。
-        "loomloom_video_scene_count": 1,
+        "loomloom_video_scene_count": _saved_ui_number(
+            "loomloom_video_scene_count",
+            1,
+            1,
+            loomloom.MAX_VIDEO_SCENES,
+            int,
+        ),
     }
     for key, value in defaults.items():
         st.session_state.setdefault(key, value)
@@ -1610,14 +1728,23 @@ def get_llm_provider_tips(provider_id, **kwargs):
     if not tips:
         return tips
 
+    service_endpoint = provider.preferred_service_endpoint(
+        prefer_international=tips_language == "en"
+    )
+    api_key_url = (
+        service_endpoint.api_key_url
+        if service_endpoint
+        else provider.effective_api_key_url()
+    )
     format_context = {
-        "api_key_url": (
-            provider.international_api_key_url
-            if tips_language == "en" and provider.international_api_key_url
-            else provider.api_key_url
-        ),
+        "api_key_url": api_key_url,
         "default_model": provider.default_model,
-        "default_base_url": provider.default_base_url,
+        "default_base_url": (
+            service_endpoint.base_url
+            if service_endpoint
+            else provider.effective_default_base_url
+        ),
+        "model_docs_url": service_endpoint.model_docs_url if service_endpoint else "",
         **{
             f"default_{field.config_suffix}": field.default_value
             for field in provider.extra_fields
@@ -1629,6 +1756,32 @@ def get_llm_provider_tips(provider_id, **kwargs):
     except Exception as e:
         logger.warning(f"format llm provider tips failed: {provider_id}, {e}")
         return tips
+
+
+def format_llm_connection_error(provider_id, base_url, error):
+    """为可明确定位的鉴权错误补充配置检查建议，同时保留原始响应。"""
+    error_text = str(error or "").strip()
+    normalized_error = error_text.lower()
+    authentication_markers = (
+        "401",
+        "authentication",
+        "invalid api key",
+        "invalid_api_key",
+        "unauthorized",
+    )
+    provider = get_llm_provider(provider_id)
+    if provider is None or not provider.service_endpoints or not any(
+        marker in normalized_error for marker in authentication_markers
+    ):
+        return error_text
+
+    message = tr_optional(
+        provider.authentication_error_key,
+        fallback_language="en",
+    )
+    if not message:
+        return error_text
+    return message.format(base_url=base_url or "-", error=error_text)
 
 
 def get_llm_provider_label(provider):
@@ -1744,11 +1897,14 @@ def reset_subtitle_settings():
 
     # 同步会持久化的 UI 选项，确保恢复后刷新页面仍保持默认设置。
     for key in (
+        "subtitle_enabled",
         "font_name",
         "subtitle_position",
         "custom_position",
         "text_fore_color",
         "font_size",
+        "stroke_color",
+        "stroke_width",
         "subtitle_background_enabled",
         "subtitle_background_color",
         "rounded_subtitle_background",
@@ -2049,16 +2205,95 @@ def _render_settings_dialog():
                 raise RuntimeError(f"unsupported llm provider: {llm_provider}")
 
             llm_api_key = config.app.get(llm_provider_spec.config_key("api_key"), "")
-            llm_base_url = (
-                config.app.get(llm_provider_spec.config_key("base_url"), "")
-                or llm_provider_spec.default_base_url
+            configured_llm_base_url = config.app.get(
+                llm_provider_spec.config_key("base_url"), ""
             )
-            llm_default_base_url = llm_provider_spec.default_base_url
+            llm_default_base_url = llm_provider_spec.effective_default_base_url
+            llm_base_url = configured_llm_base_url or llm_default_base_url
             llm_model_name = llm_provider_spec.resolve_model_name(
                 config.app.get(llm_provider_spec.config_key("model_name"), "")
             )
 
             provider_tip_context = {}
+            selected_service_endpoint = None
+            if llm_provider_spec.service_endpoints:
+                # Kimi 等 Provider 的中国站和国际站使用不同账号体系。只让用户
+                # 选择服务区域，再由 Registry 同步 API 申请入口和 Base URL，
+                # 避免手工组合错误。已有空 Base URL 配置继续沿用中国站，只有
+                # 尚未填写 Key 的全新配置才根据界面语言推荐对应入口。
+                selected_service_endpoint = (
+                    llm_provider_spec.select_service_endpoint(
+                        configured_llm_base_url,
+                        has_api_key=bool(str(llm_api_key).strip()),
+                        prefer_international=(
+                            st.session_state.get("ui_language", "en") != "zh"
+                        ),
+                    )
+                )
+                endpoint_options = [
+                    endpoint.endpoint_id
+                    for endpoint in llm_provider_spec.service_endpoints
+                ] + [CUSTOM_LLM_ENDPOINT_ID]
+                default_endpoint_id = (
+                    selected_service_endpoint.endpoint_id
+                    if selected_service_endpoint
+                    else CUSTOM_LLM_ENDPOINT_ID
+                )
+                endpoint_labels = {
+                    endpoint.endpoint_id: (
+                        tr_optional(
+                            llm_provider_spec.endpoint_label_key(endpoint.endpoint_id),
+                            fallback_language="en",
+                        )
+                        or endpoint.default_label
+                    )
+                    for endpoint in llm_provider_spec.service_endpoints
+                }
+                endpoint_labels[CUSTOM_LLM_ENDPOINT_ID] = (
+                    tr_optional("Custom API Endpoint", fallback_language="en")
+                    or "Custom API Endpoint"
+                )
+                with llm_form_panel:
+                    selected_endpoint_id = stable_selectbox(
+                        tr_optional(
+                            llm_provider_spec.endpoint_selector_label_key,
+                            fallback_language="en",
+                        )
+                        or tr("API Platform"),
+                        options=endpoint_options,
+                        default_value=default_endpoint_id,
+                        key=f"{llm_provider}_service_endpoint_select",
+                        format_func=lambda endpoint_id: endpoint_labels[endpoint_id],
+                        help=(
+                            tr_optional(
+                                llm_provider_spec.endpoint_selector_help_key,
+                                fallback_language="en",
+                            )
+                            or None
+                        ),
+                    )
+                selected_service_endpoint = next(
+                    (
+                        endpoint
+                        for endpoint in llm_provider_spec.service_endpoints
+                        if endpoint.endpoint_id == selected_endpoint_id
+                    ),
+                    None,
+                )
+                if selected_service_endpoint:
+                    llm_base_url = selected_service_endpoint.base_url
+                    provider_tip_context.update(
+                        {
+                            "api_key_url": selected_service_endpoint.api_key_url,
+                            "default_base_url": selected_service_endpoint.base_url,
+                            "model_docs_url": selected_service_endpoint.model_docs_url,
+                        }
+                    )
+                else:
+                    # 自定义模式只保留用户明确保存的地址，不将某个标准区域伪装
+                    # 成自定义值。输入为空时配置不会持久化，下一次仍回到兼容默认。
+                    llm_base_url = str(configured_llm_base_url or "").strip()
+
             if llm_provider == "ollama":
                 llm_default_base_url = config.get_default_ollama_base_url()
                 if not llm_base_url:
@@ -2090,7 +2325,13 @@ def _render_settings_dialog():
                 st_llm_base_url = llm_form_panel.text_input(
                     tr("Base Url"),
                     value=llm_base_url,
-                    key=f"{llm_provider}_base_url_input",
+                    key=(
+                        f"{llm_provider}_base_url_"
+                        f"{selected_service_endpoint.endpoint_id}_input"
+                        if selected_service_endpoint
+                        else f"{llm_provider}_base_url_custom_input"
+                    ),
+                    disabled=selected_service_endpoint is not None,
                 )
             st_llm_model_name = ""
             if llm_provider == "groq":
@@ -2200,6 +2441,11 @@ def _render_settings_dialog():
                         )
                     )
                 else:
+                    connection_error = format_llm_connection_error(
+                        llm_provider,
+                        st_llm_base_url,
+                        connection_error,
+                    )
                     llm_form_panel.error(
                         tr("LLM Connection Test Failed").format(error=connection_error)
                     )
@@ -2372,13 +2618,14 @@ def _render_loomloom_video_settings(params):
 
     token = _effective_loomloom_api_token()
 
-    st.number_input(
+    scene_count = st.number_input(
         tr("AI Video Scene Count"),
         min_value=1,
         max_value=loomloom.MAX_VIDEO_SCENES,
         step=1,
         key="loomloom_video_scene_count",
     )
+    _set_runtime_config("ui", "loomloom_video_scene_count", int(scene_count))
     batch, input_signature = _current_loomloom_video_quote_context(params)
     if not token:
         st.warning(tr("Shengsuan Cloud API Key Required"))
@@ -2641,7 +2888,6 @@ def _render_loomloom_script_generation(params):
         tr("Script Candidate Count"),
         min_value=1,
         max_value=loomloom.MAX_SCRIPT_CANDIDATES,
-        value=3,
         step=1,
         key="loomloom_candidate_count",
     )
@@ -2649,9 +2895,12 @@ def _render_loomloom_script_generation(params):
         tr("Target Script Duration Seconds"),
         min_value=10,
         max_value=600,
-        value=60,
         step=10,
         key="loomloom_script_duration_seconds",
+    )
+    _set_runtime_config("ui", "loomloom_candidate_count", int(candidate_count))
+    _set_runtime_config(
+        "ui", "loomloom_script_duration_seconds", int(duration_seconds)
     )
     input_signature = _loomloom_script_signature(
         subject=params.video_subject,
@@ -2831,13 +3080,18 @@ def _render_script_settings(panel, params):
             selected_language_code = stable_selectbox(
                 tr("Script Language"),
                 options=[value for _, value in video_languages],
-                default_value="",
+                default_value=_saved_ui_choice(
+                    "video_language",
+                    [value for _, value in video_languages],
+                    "",
+                ),
                 key="script_language_select",
                 format_func=lambda value: dict(
                     (v, label) for label, v in video_languages
                 )[value],
             )
             params.video_language = selected_language_code
+            _set_runtime_config("ui", "video_language", params.video_language)
 
             # 使用带 key 的局部容器限定折叠入口样式，保持 expander 的原生交互，
             # 同时避免样式误伤页面顶部的“基础设置”等其他折叠区域。
@@ -2860,12 +3114,14 @@ def _render_script_settings(panel, params):
                         "app", "script_generation_backend", script_generation_backend
                     )
 
-                    st.session_state.setdefault("paragraph_number_input", 1)
                     params.paragraph_number = st.slider(
                         tr("Script Paragraph Number"),
                         min_value=llm.MIN_SCRIPT_PARAGRAPH_NUMBER,
                         max_value=llm.MAX_SCRIPT_PARAGRAPH_NUMBER,
                         key="paragraph_number_input",
+                    )
+                    _set_runtime_config(
+                        "ui", "paragraph_number", params.paragraph_number
                     )
                     params.video_script_prompt = st.text_area(
                         tr("Custom Script Requirements"),
@@ -2874,6 +3130,9 @@ def _render_script_settings(panel, params):
                         placeholder=tr("Custom Script Requirements Placeholder"),
                         key="video_script_prompt",
                     ).strip()
+                    _set_runtime_config(
+                        "ui", "video_script_prompt", params.video_script_prompt
+                    )
 
                     system_prompt = st.text_area(
                         tr("Custom System Prompt"),
@@ -2887,6 +3146,9 @@ def _render_script_settings(panel, params):
                         ""
                         if system_prompt == llm.DEFAULT_SCRIPT_SYSTEM_PROMPT.strip()
                         else system_prompt
+                    )
+                    _set_runtime_config(
+                        "ui", "custom_system_prompt", params.custom_system_prompt
                     )
 
                     restore_prompt_col, preview_prompt_col = st.columns(2)
@@ -3016,7 +3278,11 @@ def _render_video_settings(panel, params):
             selected_concat_mode = stable_selectbox(
                 tr("Video Concat Mode"),
                 options=[value for _, value in video_concat_modes],
-                default_value=VideoConcatMode.random.value,
+                default_value=_saved_ui_choice(
+                    "video_concat_mode",
+                    [value for _, value in video_concat_modes],
+                    VideoConcatMode.random.value,
+                ),
                 key="video_concat_mode_select",
                 format_func=lambda value: dict(
                     (v, label) for label, v in video_concat_modes
@@ -3036,6 +3302,12 @@ def _render_video_settings(panel, params):
                 "match_materials_to_script",
                 params.match_materials_to_script,
             )
+            # 顺序匹配开启时，sequential 是派生出的强制值，不应覆盖用户在关闭
+            # 该功能时选择的拼接偏好；关闭后仍能恢复此前的 random/sequential。
+            if not params.match_materials_to_script:
+                _set_runtime_config(
+                    "ui", "video_concat_mode", params.video_concat_mode.value
+                )
 
             # 视频转场模式
             video_transition_modes = [
@@ -3051,13 +3323,22 @@ def _render_video_settings(panel, params):
             selected_transition_mode = stable_selectbox(
                 tr("Video Transition Mode"),
                 options=[value for _, value in video_transition_modes],
-                default_value=VideoTransitionMode.none.value,
+                default_value=_saved_ui_choice(
+                    "video_transition_mode",
+                    [value for _, value in video_transition_modes],
+                    VideoTransitionMode.none.value,
+                ),
                 key="video_transition_mode_select",
                 format_func=lambda value: dict(
                     (v, label) for label, v in video_transition_modes
                 )[value],
             )
             params.video_transition_mode = VideoTransitionMode(selected_transition_mode)
+            _set_runtime_config(
+                "ui",
+                "video_transition_mode",
+                params.video_transition_mode.value,
+            )
 
             video_aspect_ratios = [
                 (tr("Portrait"), VideoAspect.portrait.value),
@@ -3070,30 +3351,48 @@ def _render_video_settings(panel, params):
             #   - 用户在某 source 下手动改过 aspect,session_state 会记住,
             #     下次回到同一 source 时尊重用户选择,不会再被强制覆盖。
             default_aspect_index = 1 if params.video_source == "coverr" else 0
+            video_aspect_values = [value for _, value in video_aspect_ratios]
+            video_aspect_config_key = f"video_aspect_{params.video_source}"
             selected_aspect_ratio = stable_selectbox(
                 tr("Video Ratio"),
-                options=[value for _, value in video_aspect_ratios],
-                default_value=video_aspect_ratios[default_aspect_index][1],
+                options=video_aspect_values,
+                default_value=_saved_ui_choice(
+                    video_aspect_config_key,
+                    video_aspect_values,
+                    video_aspect_ratios[default_aspect_index][1],
+                ),
                 key=f"video_aspect_for_{params.video_source}",
                 format_func=lambda value: dict(
                     (v, label) for label, v in video_aspect_ratios
                 )[value],
             )
             params.video_aspect = VideoAspect(selected_aspect_ratio)
+            _set_runtime_config(
+                "ui", video_aspect_config_key, params.video_aspect.value
+            )
 
+            video_clip_durations = [2, 3, 4, 5, 6, 7, 8, 9, 10]
             params.video_clip_duration = stable_selectbox(
                 tr("Clip Duration"),
-                options=[2, 3, 4, 5, 6, 7, 8, 9, 10],
-                default_value=3,
+                options=video_clip_durations,
+                default_value=_saved_ui_choice(
+                    "video_clip_duration", video_clip_durations, 3
+                ),
                 key="video_clip_duration_select",
                 help=tr("Clip Duration Help"),
+            )
+            _set_runtime_config(
+                "ui", "video_clip_duration", params.video_clip_duration
             )
             clip_speed_key = localized_widget_key("video_clip_speed_slider")
             # session_state 可能来自旧任务、API 参数或旧版页面状态。控件创建前
             # 统一归一化，既保留合法选择，也确保 slider 始终收到 0.5～2.0
             # 范围内的有限浮点数。
             st.session_state[clip_speed_key] = utils.normalize_clip_speed(
-                st.session_state.get(clip_speed_key, 1.0)
+                st.session_state.get(
+                    clip_speed_key,
+                    _saved_ui_number("video_clip_speed", 1.0, 0.5, 2.0),
+                )
             )
             params.video_clip_speed = st.slider(
                 tr("Clip Speed"),
@@ -3104,12 +3403,17 @@ def _render_video_settings(panel, params):
                 key=clip_speed_key,
                 help=tr("Clip Speed Help"),
             )
+            _set_runtime_config("ui", "video_clip_speed", params.video_clip_speed)
+            video_count_options = [1, 2, 3, 4, 5]
             params.video_count = stable_selectbox(
                 tr("Number of Videos Generated Simultaneously"),
-                options=[1, 2, 3, 4, 5],
-                default_value=1,
+                options=video_count_options,
+                default_value=_saved_ui_choice(
+                    "video_count", video_count_options, 1
+                ),
                 key="video_count_select",
             )
+            _set_runtime_config("ui", "video_count", params.video_count)
 
             video_codec_options = [
                 (tr("Default Video Encoder"), DEFAULT_VIDEO_CODEC_OPTION),
@@ -3467,9 +3771,19 @@ def _render_voice_preview(params, friendly_names, selected_tts_server, voice_nam
         and cached_preview.get("fingerprint") in valid_fingerprints
         and cached_preview.get("audio_bytes")
     ):
+        # 只在用户本次明确点击“试听音色”时自动播放。Streamlit 的其它控件
+        # 也会触发页面 rerun；如果对缓存音频永久开启 autoplay，修改任意设置
+        # 都可能让旧试听从头播放。完整试听继续保留手动播放，避免较长音频在
+        # 生成完成后意外打断用户。
+        should_autoplay = bool(
+            short_preview_requested
+            and cached_preview.get("preview_type") == "sample"
+            and cached_preview.get("fingerprint") == sample_fingerprint
+        )
         st.audio(
             cached_preview["audio_bytes"],
             format=cached_preview.get("mime_type", "audio/mp3"),
+            autoplay=should_autoplay,
         )
         if cached_preview.get("preview_type") == "full":
             duration = cached_preview.get("duration")
@@ -3740,6 +4054,7 @@ def _render_elevenlabs_api_key_input(label_key):
 def _render_background_music_settings(params, elevenlabs_api_key_rendered=False):
     """渲染背景音乐来源与音量设置，并返回本次待保存的上传文件。"""
     uploaded_bgm_file = None
+    previous_bgm_type = st.session_state.get("last_rendered_bgm_type")
     st.divider()
     bgm_options = [
         (tr("No Background Music"), ""),
@@ -3751,11 +4066,16 @@ def _render_background_music_settings(params, elevenlabs_api_key_rendered=False)
     selected_bgm_type = stable_selectbox(
         tr("Background Music Source"),
         options=[value for _, value in bgm_options],
-        default_value="random",
+        default_value=_saved_ui_choice(
+            "bgm_type",
+            [value for _, value in bgm_options],
+            "random",
+        ),
         key="bgm_type_select",
         format_func=lambda value: dict((v, label) for label, v in bgm_options)[value],
     )
     params.bgm_type = selected_bgm_type
+    _set_runtime_config("ui", "bgm_type", params.bgm_type)
     if params.bgm_type == "sonilo":
         configured_key = str(config.app.get("sonilo_api_key", "") or "").strip()
         effective_key = configured_key or os.getenv("SONILO_API_KEY", "").strip()
@@ -3778,14 +4098,16 @@ def _render_background_music_settings(params, elevenlabs_api_key_rendered=False)
         else:
             _render_elevenlabs_api_key_input("ElevenLabs Music API Key")
 
+    bgm_volume_options = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
     params.bgm_volume = stable_selectbox(
         tr("Background Music Volume"),
-        options=[0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0],
-        default_value=0.2,
+        options=bgm_volume_options,
+        default_value=_saved_ui_choice("bgm_volume", bgm_volume_options, 0.2),
         key="bgm_volume_select",
         format_func=lambda value: f"{int(value * 100)}%",
         disabled=not params.bgm_type,
     )
+    _set_runtime_config("ui", "bgm_volume", params.bgm_volume)
     bgm_enabled = bgm_service.should_use_bgm(params.bgm_type, params.bgm_volume)
 
     if params.bgm_type == "custom":
@@ -3878,10 +4200,20 @@ def _render_background_music_settings(params, elevenlabs_api_key_rendered=False)
                 st.info(f"{tr('Background Music Ready')}: {safe_name}")
                 params.bgm_file = safe_name
 
+        # Streamlit 会在条件控件暂时不渲染时清理其 widget state。
+        # 从其它 BGM 来源切回时用已持久化值恢复；同一来源下
+        # 用户主动清空时 previous_bgm_type 不变，因此不会被旧值反弹。
+        if previous_bgm_type != "custom":
+            st.session_state["custom_bgm_file_input"] = _saved_ui_text(
+                "custom_bgm_file"
+            )
         custom_bgm_file = st.text_input(
             tr("Custom Background Music File"),
             key="custom_bgm_file_input",
             disabled=uploaded_bgm_file is not None,
+        )
+        _set_runtime_config(
+            "ui", "custom_bgm_file", custom_bgm_file.strip()
         )
         if uploaded_bgm_file is None and custom_bgm_file and bgm_enabled:
             # 文件名由服务层映射到 storage/bgm 或 resource/songs 后校验，
@@ -3893,12 +4225,20 @@ def _render_background_music_settings(params, elevenlabs_api_key_rendered=False)
             params.bgm_file = ""
 
     if params.bgm_type == "sonilo":
+        if previous_bgm_type != "sonilo":
+            st.session_state["sonilo_bgm_prompt_input"] = _saved_ui_text(
+                "sonilo_bgm_prompt",
+                max_length=sonilo_service.MAX_PROMPT_LENGTH,
+            )
         params.video_music_prompt = st.text_input(
             tr("Sonilo Music Prompt"),
             key="sonilo_bgm_prompt_input",
             max_chars=sonilo_service.MAX_PROMPT_LENGTH,
             help=tr("Sonilo Music Prompt Help"),
         ).strip()
+        _set_runtime_config(
+            "ui", "sonilo_bgm_prompt", params.video_music_prompt
+        )
         if params.video_count > 1:
             st.warning(tr("Sonilo Multiple Videos Warning"))
         if st.button(
@@ -3914,12 +4254,20 @@ def _render_background_music_settings(params, elevenlabs_api_key_rendered=False)
             else:
                 st.success(tr("Sonilo Connection Test Succeeded"))
     elif params.bgm_type == "elevenlabs":
+        if previous_bgm_type != "elevenlabs":
+            st.session_state["elevenlabs_music_prompt_input"] = _saved_ui_text(
+                "elevenlabs_music_prompt",
+                max_length=elevenlabs_music_service.MAX_PROMPT_LENGTH,
+            )
         params.video_music_prompt = st.text_input(
             tr("ElevenLabs Music Prompt"),
             key="elevenlabs_music_prompt_input",
             max_chars=elevenlabs_music_service.MAX_PROMPT_LENGTH,
             help=tr("ElevenLabs Music Prompt Help"),
         ).strip()
+        _set_runtime_config(
+            "ui", "elevenlabs_music_prompt", params.video_music_prompt
+        )
         if params.video_count > 1:
             st.warning(tr("ElevenLabs Multiple Videos Warning"))
         if st.button(
@@ -3946,6 +4294,7 @@ def _render_background_music_settings(params, elevenlabs_api_key_rendered=False)
         and not elevenlabs_music_service.is_enabled()
     ):
         st.warning(tr("ElevenLabs API Key Required"))
+    st.session_state["last_rendered_bgm_type"] = params.bgm_type
     return uploaded_bgm_file
 
 
@@ -4099,6 +4448,23 @@ def _render_audio_settings(panel, params):
                 )
 
             friendly_names = {v: _friendly(v) for v in filtered_voices}
+
+            # Gemini 旧目录把推测的性别放在值里（例如 Charon-Male）。按基础
+            # voice name 映射到新的官方风格值，升级后继续保留用户原来的音色。
+            if (
+                selected_tts_server == "gemini-tts"
+                and saved_voice_name not in friendly_names
+            ):
+                saved_gemini_voice = voice.parse_gemini_voice_name(saved_voice_name)
+                saved_voice_name = next(
+                    (
+                        candidate
+                        for candidate in filtered_voices
+                        if voice.parse_gemini_voice_name(candidate)
+                        == saved_gemini_voice
+                    ),
+                    saved_voice_name,
+                )
 
             saved_voice_name_index = 0
 
@@ -4319,14 +4685,18 @@ def _render_audio_settings(panel, params):
             params.voice_volume = 1.0
             params.voice_rate = 1.0
             uploaded_audio_file = None
+            voice_volume_options = [0.6, 0.8, 1.0, 1.2, 1.5, 2.0, 3.0, 4.0, 5.0]
+            voice_rate_options = [0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.5, 1.8, 2.0]
 
             if tts_mode_enabled:
                 voice_control_cols = st.columns(2)
                 with voice_control_cols[0]:
                     params.voice_volume = stable_selectbox(
                         tr("Voiceover Volume"),
-                        options=[0.6, 0.8, 1.0, 1.2, 1.5, 2.0, 3.0, 4.0, 5.0],
-                        default_value=1.0,
+                        options=voice_volume_options,
+                        default_value=_saved_ui_choice(
+                            "voice_volume", voice_volume_options, 1.0
+                        ),
                         key="voice_volume_select",
                         format_func=lambda value: f"{int(value * 100)}%",
                         help=tr("Voiceover Volume Help"),
@@ -4335,12 +4705,16 @@ def _render_audio_settings(panel, params):
                 with voice_control_cols[1]:
                     params.voice_rate = stable_selectbox(
                         tr("Voiceover Speed"),
-                        options=[0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.5, 1.8, 2.0],
-                        default_value=1.0,
+                        options=voice_rate_options,
+                        default_value=_saved_ui_choice(
+                            "voice_rate", voice_rate_options, 1.0
+                        ),
                         key="voice_rate_select",
                         format_func=lambda value: f"{value:.1f}×",
                         help=tr("Voiceover Speed Help"),
                     )
+                _set_runtime_config("ui", "voice_volume", params.voice_volume)
+                _set_runtime_config("ui", "voice_rate", params.voice_rate)
 
                 # 试听必须位于音量和语速控件之后，确保调用使用当前控件值。
                 _render_voice_preview(
@@ -4363,12 +4737,15 @@ def _render_audio_settings(panel, params):
                 )
                 params.voice_volume = stable_selectbox(
                     tr("Voiceover Volume"),
-                    options=[0.6, 0.8, 1.0, 1.2, 1.5, 2.0, 3.0, 4.0, 5.0],
-                    default_value=1.0,
+                    options=voice_volume_options,
+                    default_value=_saved_ui_choice(
+                        "voice_volume", voice_volume_options, 1.0
+                    ),
                     key="voice_volume_select",
                     format_func=lambda value: f"{int(value * 100)}%",
                     help=tr("Voiceover Volume Help"),
                 )
+                _set_runtime_config("ui", "voice_volume", params.voice_volume)
                 if uploaded_audio_file:
                     st.audio(uploaded_audio_file, format="audio/mp3")
                     st.info(
@@ -4390,12 +4767,16 @@ def _render_subtitle_settings(panel, params):
             st.write(tr("Subtitle Settings"))
             st.session_state.setdefault(
                 "subtitle_enabled_checkbox",
-                DEFAULT_SUBTITLE_SETTINGS["subtitle_enabled"],
+                _saved_ui_bool(
+                    "subtitle_enabled",
+                    DEFAULT_SUBTITLE_SETTINGS["subtitle_enabled"],
+                ),
             )
             params.subtitle_enabled = st.checkbox(
                 tr("Enable Subtitles"),
                 key="subtitle_enabled_checkbox",
             )
+            _set_runtime_config("ui", "subtitle_enabled", params.subtitle_enabled)
             subtitle_settings_disabled = not params.subtitle_enabled
             font_names = get_all_fonts()
             saved_font_name = config.ui.get(
@@ -4495,16 +4876,26 @@ def _render_subtitle_settings(panel, params):
             stroke_cols = st.columns([0.42, 0.58])
             with stroke_cols[0]:
                 st.session_state.setdefault(
-                    "stroke_color_picker", DEFAULT_SUBTITLE_SETTINGS["stroke_color"]
+                    "stroke_color_picker",
+                    _saved_ui_color(
+                        "stroke_color", DEFAULT_SUBTITLE_SETTINGS["stroke_color"]
+                    ),
                 )
                 params.stroke_color = st.color_picker(
                     tr("Stroke Color"),
                     key="stroke_color_picker",
                     disabled=subtitle_settings_disabled,
                 )
+                _set_runtime_config("ui", "stroke_color", params.stroke_color)
             with stroke_cols[1]:
                 st.session_state.setdefault(
-                    "stroke_width_slider", DEFAULT_SUBTITLE_SETTINGS["stroke_width"]
+                    "stroke_width_slider",
+                    _saved_ui_number(
+                        "stroke_width",
+                        DEFAULT_SUBTITLE_SETTINGS["stroke_width"],
+                        0.0,
+                        10.0,
+                    ),
                 )
                 params.stroke_width = st.slider(
                     tr("Stroke Width"),
@@ -4513,6 +4904,7 @@ def _render_subtitle_settings(panel, params):
                     key="stroke_width_slider",
                     disabled=subtitle_settings_disabled,
                 )
+                _set_runtime_config("ui", "stroke_width", params.stroke_width)
 
             # 背景开关的本地化名称普遍比颜色标签更长，因此让开关占据略多空间。
             subtitle_bg_cols = st.columns([0.55, 0.45])
