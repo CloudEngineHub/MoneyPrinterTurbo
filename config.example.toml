@@ -536,6 +536,9 @@ api_key = ""
 # Available models include eleven_multilingual_v2, eleven_flash_v2_5, and eleven_v3.
 model_id = "eleven_multilingual_v2"
 # Video-to-Music uses a separate model family while sharing the same API key.
+# music_base_url only configures the Video-to-Music endpoint, so it can point at
+# a proxy or a self-hosted gateway while the voice API keeps the default host.
+music_base_url = "https://api.elevenlabs.io"
 music_model_id = "music_v2"
 music_timeout = 600
 
@@ -624,6 +627,7 @@ open_task_folder_on_completion = true
 # video_count = 1
 # tts_server = "azure-tts-v1"
 # voice_name = ""
+# voice_mode = "tts"                 # "tts", "upload", or "none"
 # voice_volume = 1.0
 # voice_rate = 1.0
 # bgm_type = "random"
@@ -632,12 +636,14 @@ open_task_folder_on_completion = true
 # sonilo_bgm_prompt = ""
 # elevenlabs_music_prompt = ""
 # subtitle_enabled = true
+# subtitle_display_mode = "sentence" # "sentence" or "word_by_word"
+# subtitle_animation = "none"        # "none" or "pop_spring"
 # font_name = "MicrosoftYaHeiBold.ttc"
 # font_size = 60
 # text_fore_color = "#FFFFFF"
 # stroke_color = "#000000"
 # stroke_width = 1.5
-# subtitle_position = "bottom" # "top", "center", "bottom", or "custom"
+# subtitle_position = "bottom" # "top", "center", "bottom", "two_thirds_bottom", or "custom"
 # custom_position = 70.0       # Percentage from the top when using "custom"
 # subtitle_background_enabled = false
 # subtitle_background_color = "#000000"
