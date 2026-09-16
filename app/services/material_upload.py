@@ -18,8 +18,12 @@ MAX_VIDEO_MATERIAL_UPLOAD_BYTES = 200 * 1024 * 1024
 MAX_IMAGE_MATERIAL_UPLOAD_BYTES = 20 * 1024 * 1024
 MATERIAL_VALIDATION_TIMEOUT_SECONDS = 120
 
-SUPPORTED_VIDEO_EXTENSIONS = (".mp4", ".mov", ".avi", ".flv", ".mkv")
-SUPPORTED_IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png")
+# Keep these aligned with the local material formats the CLI accepts (cli.py
+# derives its list from const.FILE_TYPE_VIDEOS / const.FILE_TYPE_IMAGES) and the
+# render pipeline classifies (video.py reads const.FILE_TYPE_IMAGES). Accepting a
+# narrower set here rejects uploads the rest of the pipeline already supports.
+SUPPORTED_VIDEO_EXTENSIONS = (".mp4", ".mov", ".avi", ".flv", ".mkv", ".webm")
+SUPPORTED_IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".bmp")
 SUPPORTED_MATERIAL_EXTENSIONS = (
     *SUPPORTED_VIDEO_EXTENSIONS,
     *SUPPORTED_IMAGE_EXTENSIONS,
@@ -27,10 +31,17 @@ SUPPORTED_MATERIAL_EXTENSIONS = (
 
 _COPY_CHUNK_BYTES = 1024 * 1024
 _INTERNAL_UPLOAD_PREFIX = ".material-upload-"
+_WINDOWS_INVALID_FILENAME_CHARS = frozenset('<>:"|?*')
+_WINDOWS_RESERVED_FILENAMES = frozenset(
+    {"CON", "PRN", "AUX", "NUL"}
+    | {f"COM{index}" for index in range(1, 10)}
+    | {f"LPT{index}" for index in range(1, 10)}
+)
 _IMAGE_FORMATS_BY_EXTENSION = {
     ".jpg": frozenset({"JPEG"}),
     ".jpeg": frozenset({"JPEG"}),
     ".png": frozenset({"PNG"}),
+    ".bmp": frozenset({"BMP"}),
 }
 
 
@@ -81,8 +92,18 @@ def sanitize_material_filename(filename: str) -> str:
         or safe_name in {".", ".."}
         or len(safe_name) > 255
         or any(ord(character) < 32 for character in safe_name)
+        or any(character in _WINDOWS_INVALID_FILENAME_CHARS for character in safe_name)
         or safe_name.lower().startswith(_INTERNAL_UPLOAD_PREFIX)
     ):
+        raise MaterialUploadError("invalid local material filename")
+
+    # Keep the same rule as bgm.sanitize_upload_filename: Windows resolves the
+    # segment before the extension as a device name, so CON.mp4 and LPT1.webm
+    # cannot be created as ordinary files there. Even though the stored name is
+    # a UUID in both endpoints, rejecting these names up front keeps the two
+    # upload APIs behaving identically on every platform.
+    windows_basename = safe_name.split(".", 1)[0].rstrip(" .").upper()
+    if windows_basename in _WINDOWS_RESERVED_FILENAMES:
         raise MaterialUploadError("invalid local material filename")
     _material_kind(safe_name)
     return safe_name
@@ -113,7 +134,7 @@ def _validate_image(file_path: str, extension: str) -> None:
         ValueError,
     ) as exc:
         raise MaterialUploadError(
-            "uploaded file must contain a valid JPEG or PNG image"
+            "uploaded file must contain a valid JPEG, PNG, or BMP image"
         ) from exc
 
 

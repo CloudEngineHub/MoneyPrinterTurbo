@@ -9,6 +9,7 @@ from uuid import UUID
 
 from PIL import Image, UnidentifiedImageError
 
+from app.models import const
 from app.services import material_upload
 
 
@@ -43,6 +44,37 @@ class TestMaterialUploadService(unittest.TestCase):
             with self.subTest(filename=filename):
                 with self.assertRaises(material_upload.MaterialUploadError):
                     material_upload.sanitize_material_filename(filename)
+
+    def test_sanitize_filename_rejects_windows_invalid_and_reserved_names(self):
+        # bgm.sanitize_upload_filename already applies these Windows rules to the
+        # background-music upload. The local material upload also stores its file
+        # under a UUID, so the two endpoints must agree on which client-supplied
+        # names they accept instead of diverging by platform.
+        for filename in (
+            "CON.mp4",
+            "con.mp4",
+            "lpt1.webm",
+            "aux.extra.mp4",
+            "bad:name.mp4",
+            "bad?.mp4",
+            "bad<1>.mp4",
+            'quote".mp4',
+            "pipe|name.mp4",
+            "star*.mp4",
+        ):
+            with self.subTest(filename=filename):
+                with self.assertRaises(material_upload.MaterialUploadError):
+                    material_upload.sanitize_material_filename(filename)
+
+        # Names that merely contain a reserved word, or an invalid character in
+        # the extension-less stem, are still ordinary uploads.
+        self.assertEqual(
+            material_upload.sanitize_material_filename("console.mp4"), "console.mp4"
+        )
+        self.assertEqual(
+            material_upload.sanitize_material_filename(r"C:\videos\aux-extra.png"),
+            "aux-extra.png",
+        )
 
     def test_video_upload_is_chunked_validated_and_atomically_persisted(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -117,7 +149,7 @@ class TestMaterialUploadService(unittest.TestCase):
                         "renamed.png", io.BytesIO(_image_bytes("JPEG"))
                     )
                 with self.assertRaisesRegex(
-                    material_upload.MaterialUploadError, "valid JPEG or PNG"
+                    material_upload.MaterialUploadError, "valid JPEG, PNG, or BMP"
                 ):
                     material_upload.save_material_upload(
                         "broken.jpg", io.BytesIO(b"not-an-image")
@@ -125,6 +157,55 @@ class TestMaterialUploadService(unittest.TestCase):
 
             self.assertTrue(stored_name.endswith(".png"))
             self.assertEqual(len(os.listdir(temp_dir)), 1)
+
+    def test_webm_and_bmp_materials_are_accepted(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with (
+                patch.object(
+                    material_upload, "uploaded_material_dir", return_value=temp_dir
+                ),
+                patch.object(material_upload, "_validate_video") as validate_video,
+            ):
+                video_name = material_upload.save_material_upload(
+                    "clip.webm", io.BytesIO(b"decodable-video-placeholder")
+                )
+                image_name = material_upload.save_material_upload(
+                    "photo.bmp", io.BytesIO(_image_bytes("BMP"))
+                )
+
+                # The declared extension still has to match the real image format.
+                with self.assertRaisesRegex(
+                    material_upload.MaterialUploadError, "does not match"
+                ):
+                    material_upload.save_material_upload(
+                        "renamed.bmp", io.BytesIO(_image_bytes("PNG"))
+                    )
+
+            self.assertTrue(video_name.endswith(".webm"))
+            self.assertTrue(image_name.endswith(".bmp"))
+            validate_video.assert_called_once()
+            self.assertEqual(len(os.listdir(temp_dir)), 2)
+
+    def test_supported_extensions_cover_cli_accepted_formats(self):
+        cli_accepted_formats = {
+            *(f".{extension}" for extension in const.FILE_TYPE_VIDEOS),
+            *(f".{extension}" for extension in const.FILE_TYPE_IMAGES),
+            ".avi",
+            ".flv",
+        }
+        supported = set(material_upload.SUPPORTED_MATERIAL_EXTENSIONS)
+
+        self.assertTrue(
+            cli_accepted_formats.issubset(supported),
+            "local material upload must accept every format the CLI accepts; "
+            f"missing: {sorted(cli_accepted_formats - supported)}",
+        )
+        # Every accepted image extension needs a declared Pillow format, otherwise
+        # image validation raises instead of returning MaterialUploadError.
+        self.assertEqual(
+            set(material_upload.SUPPORTED_IMAGE_EXTENSIONS),
+            set(material_upload._IMAGE_FORMATS_BY_EXTENSION),
+        )
 
     def test_renamed_image_is_not_accepted_as_video(self):
         with tempfile.TemporaryDirectory() as temp_dir:
