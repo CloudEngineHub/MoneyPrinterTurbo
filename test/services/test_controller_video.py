@@ -8,11 +8,13 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import redis
 from fastapi.testclient import TestClient
 
 from app import asgi
 from app.config import config
 from app.controllers.manager.base_manager import TaskQueueFullError
+from app.controllers.manager.redis_manager import RedisTaskManager
 from app.controllers.v1 import video as video_controller
 from app.models import const
 from app.models.exception import HttpException
@@ -60,6 +62,26 @@ class TestVideoControllerHelpers(unittest.TestCase):
             asyncio.run(run_lifespan())
 
         recover.assert_called_once_with()
+
+    def test_fastapi_startup_resumes_persisted_redis_queue(self):
+        """A restart must dispatch queued Redis work before serving requests."""
+        from app.services import task as task_service
+
+        with patch("app.controllers.manager.redis_manager.redis.Redis.from_url"):
+            manager = RedisTaskManager(2, "redis://localhost:6379/0")
+
+        with (
+            patch.object(video_controller, "task_manager", manager),
+            patch.object(manager, "check_queue") as check_queue,
+            patch.object(task_service, "recover_interrupted_cross_posts"),
+        ):
+            async def run_lifespan():
+                async with asgi.application_lifespan(asgi.app):
+                    pass
+
+            asyncio.run(run_lifespan())
+
+        self.assertEqual(check_queue.call_count, 2)
 
     def test_sanitize_upload_filename_rejects_empty_name(self):
         """空文件名和目录占位符不能进入服务端存储路径。"""
@@ -705,6 +727,27 @@ class TestBuildRedisUrl(unittest.TestCase):
             _build_redis_url("redis-host", 6380, 1, "s3cr3t"),
             "redis://:s3cr3t@redis-host:6380/1",
         )
+
+    def test_reserved_characters_in_password_round_trip_through_redis_url(self):
+        from app.controllers.v1.video import _build_redis_url
+
+        password = "p@ss:/?#% word"
+        url = _build_redis_url("redis-host", 6380, 1, password)
+
+        self.assertEqual(
+            redis.Redis.from_url(url).connection_pool.connection_kwargs["password"],
+            password,
+        )
+
+    def test_ipv6_host_round_trips_through_redis_url(self):
+        from app.controllers.v1.video import _build_redis_url
+
+        url = _build_redis_url("::1", 6380, 1, None)
+        connection = redis.Redis.from_url(url).connection_pool.connection_kwargs
+
+        self.assertEqual(connection["host"], "::1")
+        self.assertEqual(connection["port"], 6380)
+        self.assertEqual(connection["db"], 1)
 
 
 if __name__ == "__main__":
