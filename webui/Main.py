@@ -44,6 +44,7 @@ from app.models.schema import (
     VideoTransitionMode,
 )
 from app.services import bgm as bgm_service
+from app.services import material_upload as material_upload_service
 from app.services import (
     cache_manager,
     llm,
@@ -253,6 +254,9 @@ SETTINGS_PRESET_FILE_NAME = "moneyprinterturbo-settings.json"
 KEY_BACKUP_SCHEMA = "moneyprinterturbo.key-backup"
 KEY_BACKUP_VERSION = 1
 KEY_BACKUP_FILE_NAME = "moneyprinterturbo-keys.json"
+# Export files contain only settings or credentials, not media. Reject oversized
+# uploads before decoding and parsing them in the Streamlit process.
+MAX_SETTINGS_TRANSFER_BYTES = 2 * 1024 * 1024
 # 预设只描述生成参数。素材、配音和配乐都是本机文件路径，预设通常要在另一台
 # 机器或另一个容器里导入，带上这些路径只会指向不存在的文件。
 PRESET_EXCLUDED_PARAM_KEYS = frozenset(
@@ -613,6 +617,43 @@ def _build_uploaded_file_path(uploaded_file, target_dir, allowed_extensions, pre
     return file_path
 
 
+def _save_uploaded_local_materials(uploaded_files):
+    """Validate a WebUI material batch and undo earlier files on failure."""
+    local_videos_dir = utils.storage_dir("local_videos", create=True)
+    materials = []
+    persisted = []
+    saved_paths = []
+    try:
+        for uploaded_file in uploaded_files:
+            stored_name = material_upload_service.save_material_upload(
+                uploaded_file.name, uploaded_file
+            )
+            file_path = os.path.join(local_videos_dir, stored_name)
+            saved_paths.append(file_path)
+            material_info = MaterialInfo()
+            material_info.provider = "local"
+            material_info.url = file_path
+            materials.append(material_info)
+            persisted.append(
+                {
+                    "provider": material_info.provider,
+                    "url": material_info.url,
+                    "duration": material_info.duration,
+                }
+            )
+    except Exception:
+        for file_path in saved_paths:
+            try:
+                os.remove(file_path)
+            except OSError as exc:
+                logger.warning(
+                    f"failed to remove local material after batch error: "
+                    f"path={file_path}, error={exc}"
+                )
+        raise
+    return materials, persisted
+
+
 def _initialize_session_state():
     """集中初始化跨 rerun 保留的页面状态。"""
     if not st.session_state.get("cross_post_recovery_checked"):
@@ -771,7 +812,11 @@ def _safe_load_task_script(task_path):
 
     try:
         with open(script_file, "r", encoding="utf-8") as f:
-            return json.load(f)
+            payload = json.load(f)
+        if not isinstance(payload, dict):
+            logger.warning(f"task script data is not an object: {script_file}")
+            return {}
+        return payload
     except Exception as e:
         logger.warning(f"failed to read task script data: {script_file}, {e}")
         return {}
@@ -964,11 +1009,16 @@ def _scan_history_tasks(limit=30):
     tasks = []
     for mtime, name, task_path in task_entries[:limit]:
         script_data = _safe_load_task_script(task_path)
-        params_data = script_data.get("params", {}) if script_data else {}
+        params_data = script_data.get("params", {})
+        if not isinstance(params_data, dict):
+            params_data = {}
+        script_text = script_data.get("script", "")
+        if not isinstance(script_text, str):
+            script_text = ""
         video_file = _find_final_task_video(task_path)
         subject = (
             params_data.get("video_subject")
-            or script_data.get("script", "")[:40]
+            or script_text[:40]
             or name
         )
         tasks.append(
@@ -989,12 +1039,28 @@ def _scan_history_tasks(limit=30):
 
 def _collect_task_summaries(limit=20):
     history_tasks = {task["task_id"]: task for task in _scan_history_tasks(limit=50)}
+    active_tasks = _active_generation_tasks()
 
     try:
         runtime_tasks, _ = sm.state.get_all_tasks(1, 50)
     except Exception as e:
         logger.warning(f"failed to load runtime tasks: {e}")
         runtime_tasks = []
+
+    # The paginated state view can omit this session's newer tasks after 50
+    # older records. Read those active IDs directly so a completed or failed
+    # task cannot remain labelled as processing forever.
+    runtime_ids = {task.get("task_id") for task in runtime_tasks}
+    for task_id in active_tasks:
+        if task_id in runtime_ids:
+            continue
+        try:
+            task = sm.state.get_task(task_id)
+        except Exception as e:
+            logger.warning(f"failed to load active task {task_id}: {e}")
+            continue
+        if task:
+            runtime_tasks.append(task)
 
     for task in runtime_tasks:
         task_id = task.get("task_id", "")
@@ -1013,6 +1079,16 @@ def _collect_task_summaries(limit=20):
             or (task.get("script", "")[:40] if task.get("script") else "")
             or task_id
         )
+        task_mtime = active_tasks.get(task_id, {}).get("mtime") or history_task.get(
+            "mtime", 0
+        )
+        if os.path.isdir(task_path):
+            try:
+                task_mtime = os.path.getmtime(task_path)
+            except OSError:
+                # Another session can delete this directory between isdir and
+                # getmtime. Keep rendering the persisted task state.
+                pass
 
         history_tasks[task_id] = {
             "task_id": task_id,
@@ -1020,15 +1096,13 @@ def _collect_task_summaries(limit=20):
             "state": task.get("state"),
             "cross_post_state": task.get("cross_post_state"),
             "progress": int(task.get("progress", 0) or 0),
-            "mtime": os.path.getmtime(task_path)
-            if os.path.isdir(task_path)
-            else history_task.get("mtime", 0),
+            "mtime": task_mtime,
             "task_path": task_path,
             "video_file": video_file,
             "source": "runtime",
         }
 
-    for task_id, active_task in _active_generation_tasks().items():
+    for task_id, active_task in active_tasks.items():
         history_task = history_tasks.get(task_id, {})
         if history_task and _task_state_filter_key(history_task) in {
             "complete",
@@ -2849,6 +2923,8 @@ def _load_transfer_payload(raw_bytes, schema, version):
     提示停留在导入入口，而不是把无法识别的内容写进配置或控件状态。
     Windows 编辑器可能保存带 BOM 的 JSON，因此按 utf-8-sig 解码。
     """
+    if len(raw_bytes) > MAX_SETTINGS_TRANSFER_BYTES:
+        raise ValueError("settings import exceeds the 2 MB limit")
     payload = json.loads(raw_bytes.decode("utf-8-sig"))
     if not isinstance(payload, dict):
         raise ValueError("exported file must contain a JSON object")
@@ -8101,6 +8177,22 @@ def _render_generation_controls(
                     CUSTOM_AUDIO_EXTENSIONS,
                     "custom-audio",
                 )
+                # Voiceover uploads previously bypassed the same full-decode
+                # and size checks used for background-music uploads. Validate
+                # before storing or scheduling the generation task.
+                bgm_service.validate_bgm_upload(
+                    uploaded_audio_file.name, uploaded_audio_file
+                )
+            except bgm_service.BgmUploadError as exc:
+                _remove_active_generation_task(task_id)
+                logger.warning(f"WebUI custom audio upload rejected: {exc}")
+                st.error(str(exc))
+                st.stop()
+            except bgm_service.BgmServiceError as exc:
+                _remove_active_generation_task(task_id)
+                logger.error(f"WebUI custom audio validation failed: {exc}")
+                st.error(str(exc))
+                st.stop()
             except ValueError:
                 _remove_active_generation_task(task_id)
                 st.error(tr("Unsupported Upload File Type"))
@@ -8110,35 +8202,21 @@ def _render_generation_controls(
             params.custom_audio_file = custom_audio_path
 
         if uploaded_files:
-            local_videos_dir = utils.storage_dir("local_videos", create=True)
             # 每次重新上传时都以本次选择的素材为准，避免旧素材不断重复追加。
-            params.video_materials = []
-            persisted_local_materials = []
-            for file in uploaded_files:
-                try:
-                    file_path = _build_uploaded_file_path(
-                        file,
-                        local_videos_dir,
-                        LOCAL_MATERIAL_EXTENSIONS,
-                        "material",
-                    )
-                except ValueError:
-                    _remove_active_generation_task(task_id)
-                    st.error(tr("Unsupported Upload File Type"))
-                    st.stop()
-                with open(file_path, "wb") as f:
-                    f.write(file.getbuffer())
-                    m = MaterialInfo()
-                    m.provider = "local"
-                    m.url = file_path
-                    params.video_materials.append(m)
-                    persisted_local_materials.append(
-                        {
-                            "provider": m.provider,
-                            "url": m.url,
-                            "duration": m.duration,
-                        }
-                    )
+            try:
+                params.video_materials, persisted_local_materials = (
+                    _save_uploaded_local_materials(uploaded_files)
+                )
+            except material_upload_service.MaterialUploadError as exc:
+                _remove_active_generation_task(task_id)
+                logger.warning(f"WebUI local material upload rejected: {exc}")
+                st.error(str(exc))
+                st.stop()
+            except material_upload_service.MaterialServiceError as exc:
+                _remove_active_generation_task(task_id)
+                logger.error(f"WebUI local material upload failed: {exc}")
+                st.error(str(exc))
+                st.stop()
             # 将已上传并保存到本地的视频素材写入会话，供后续只改文案时直接复用。
             st.session_state["local_video_materials"] = persisted_local_materials
         elif (
