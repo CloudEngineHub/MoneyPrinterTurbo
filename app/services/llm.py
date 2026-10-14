@@ -835,9 +835,22 @@ def generate_script(
 
     def format_response(response):
         # Clean the script
-        # Remove asterisks, hashes
+        # Remove emphasis and heading markers without changing inline names
+        # or musical notes such as C#, F# and G#.
         response = response.replace("*", "")
-        response = response.replace("#", "")
+        response = re.sub(
+            r"(?m)^[ \t]{0,3}#{1,6}[ \t]+(.*?)[ \t]*$",
+            lambda match: re.sub(r"[ \t]+#+[ \t]*$", "", match.group(1)),
+            response,
+        )
+
+        # Link labels are narration; discard destinations before stripping
+        # bracketed stage directions. Common parenthesized URL components fit.
+        response = re.sub(
+            r"\[([^\]\n]+)\]\((?:[^()\n]|\([^()\n]*\))*\)",
+            lambda match: match.group(1),
+            response,
+        )
 
         # Remove markdown syntax.  Use non-greedy .*? so each bracket/paren
         # group is removed independently; the greedy form would eat all text
@@ -903,6 +916,20 @@ def _strip_code_fence(text: str) -> str:
         t = re.sub(r"^```[a-zA-Z0-9]*\s*", "", t)
         t = re.sub(r"\s*```$", "", t)
     return t.strip()
+
+
+def _extract_embedded_json(text: str, opening: str):
+    """Decode one complete JSON value without absorbing later prose/examples."""
+    decoder = json.JSONDecoder()
+    for index, character in enumerate(text or ""):
+        if character != opening:
+            continue
+        try:
+            value, _end = decoder.raw_decode(text[index:])
+        except json.JSONDecodeError:
+            continue
+        return value
+    raise ValueError("response contains no complete JSON value")
 
 
 def generate_terms(
@@ -990,15 +1017,10 @@ Please note that you must use English for generating video search terms; Chinese
         except Exception as e:
             logger.warning(f"failed to generate video terms: {str(e)}")
             if response:
-                match = re.search(r"\[.*]", response, re.DOTALL)
-                if match:
-                    try:
-                        search_terms = json.loads(match.group())
-                    except Exception as e:
-                        # 这里保留重试流程，但必须记录 LLM 返回的非标准 JSON，
-                        # 否则后续排查搜索词为空时无法定位
-                        # 是模型格式问题还是解析逻辑问题。
-                        logger.warning(f"failed to generate video terms: {str(e)}")
+                try:
+                    search_terms = _extract_embedded_json(response, "[")
+                except ValueError as e:
+                    logger.warning(f"failed to generate video terms: {str(e)}")
 
         # Apply the same contract to direct JSON and prose-wrapped recovery.
         # Otherwise a nonempty array of numbers or objects reaches material search.
@@ -1196,9 +1218,7 @@ def _parse_social_metadata(response: str, platform: str) -> dict:
     except Exception:
         # 部分模型会在 JSON 外层包一段说明文字或 markdown fence。
         # API 调用方只需要稳定结构，所以这里尝试提取第一个 JSON object。
-        match = re.search(r"\{.*\}", response or "", re.DOTALL)
-        if match:
-            data = json.loads(match.group())
+        data = _extract_embedded_json(response, "{")
 
     if not isinstance(data, dict):
         raise ValueError("social metadata response is not a JSON object")
