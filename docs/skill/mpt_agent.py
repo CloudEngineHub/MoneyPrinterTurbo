@@ -201,10 +201,22 @@ def _plain_config_value(text: str, key: str) -> str:
 def _replace_config_value(text: str, key: str, value: object) -> str:
     """Replace one active field while preserving the configuration layout."""
     pattern = re.compile(rf"(?m)^({re.escape(key)}\s*=\s*).*$")
-    if not pattern.search(text):
+    match = pattern.search(text)
+    if match is None:
         raise SkillError(f"configuration field not found in config.toml: {key}")
+    value_start = match.start() + len(match.group(1))
+    value_end = match.end()
+    while True:
+        try:
+            tomllib.loads("replacement = " + text[value_start:value_end])
+            break
+        except tomllib.TOMLDecodeError as exc:
+            next_line = text.find("\n", value_end + 1)
+            if value_end == len(text):
+                raise SkillError("configuration field is not valid TOML") from exc
+            value_end = len(text) if next_line < 0 else next_line
     encoded = json.dumps(value, ensure_ascii=False)
-    return pattern.sub(lambda match: f"{match.group(1)}{encoded}", text, count=1)
+    return text[:value_start] + encoded + text[value_end:]
 
 
 def _has_configured_value(value: str) -> bool:
@@ -262,7 +274,7 @@ def apply_environment_config(config_path: Path) -> None:
         return
 
     text = config_path.read_text(encoding="utf-8")
-    current_provider = _plain_config_value(text, "llm_provider") or "moonshot"
+    current_provider = (_plain_config_value(text, "llm_provider") or "moonshot").lower()
     provider = provider or current_provider
     changes: list[str] = []
     if os.environ.get("MPT_LLM_PROVIDER", "").strip():
@@ -332,7 +344,7 @@ def reuse_existing_llm_provider(config_path: Path) -> str:
     values are inspected in memory and are never logged.
     """
     text = config_path.read_text(encoding="utf-8")
-    current_provider = _plain_config_value(text, "llm_provider") or "moonshot"
+    current_provider = (_plain_config_value(text, "llm_provider") or "moonshot").lower()
     if _provider_is_ready(text, current_provider):
         return current_provider
 
@@ -368,7 +380,7 @@ def has_cli_option(cli_args: list[str], option: str) -> bool:
 def missing_config(config_path: Path, cli_args: list[str]) -> tuple[str, list[str]]:
     """Return the active provider and only the fields required by this run."""
     text = config_path.read_text(encoding="utf-8")
-    provider = _plain_config_value(text, "llm_provider") or "moonshot"
+    provider = (_plain_config_value(text, "llm_provider") or "moonshot").lower()
     missing: list[str] = []
     if provider not in KEYLESS_LLM_PROVIDERS and not _has_configured_value(
         _plain_config_value(text, f"{provider}_api_key")
@@ -395,9 +407,9 @@ def missing_config(config_path: Path, cli_args: list[str]) -> tuple[str, list[st
         # 与运行时 Provider 保持完全一致的凭据优先级，避免 Skill 预检通过后
         # 主程序却读取了另一把 Key。ARK_API_KEY 语义过于宽泛，明确不再兼容。
         value = (
-            _plain_config_value(text, "volcengine_seedance_api_key")
+            _plain_config_value(text, "volcengine_seedance_api_key").strip()
             or os.environ.get("VOLCENGINE_ARK_API_KEY", "").strip()
-            or _plain_config_value(text, "volcengine_api_key")
+            or _plain_config_value(text, "volcengine_api_key").strip()
         )
         if not _has_configured_value(value):
             missing.append("volcengine_seedance_api_key")
@@ -416,7 +428,7 @@ def missing_config(config_path: Path, cli_args: list[str]) -> tuple[str, list[st
         # 与运行时 Provider 保持完全一致的凭据优先级：配置键优先，其次是
         # 语义明确的 OFOX_API_KEY 环境变量。
         value = (
-            _plain_config_value(text, "ofox_api_key")
+            _plain_config_value(text, "ofox_api_key").strip()
             or os.environ.get("OFOX_API_KEY", "").strip()
         )
         if not _has_configured_value(value):
@@ -427,7 +439,7 @@ def missing_config(config_path: Path, cli_args: list[str]) -> tuple[str, list[st
         # 秘塔 Key 与 MiniMax 官方 LLM Key 不互通，Skill 必须沿用运行时的
         # 独立配置优先级，不能因为已经配置 minimax_api_key 就误判为可用。
         value = (
-            _plain_config_value(text, "metaso_minimax_api_key")
+            _plain_config_value(text, "metaso_minimax_api_key").strip()
             or os.environ.get("METASO_MINIMAX_API_KEY", "").strip()
         )
         if not _has_configured_value(value):
@@ -436,7 +448,7 @@ def missing_config(config_path: Path, cli_args: list[str]) -> tuple[str, list[st
             missing.append("confirm_metaso_minimax_charge")
     elif source == "muapi":
         value = (
-            _plain_config_value(text, "muapi_api_key")
+            _plain_config_value(text, "muapi_api_key").strip()
             or os.environ.get("MUAPI_API_KEY", "").strip()
         )
         if not _has_configured_value(value):
@@ -730,15 +742,31 @@ def generate_video(
     ]
     log(f"starting video generation, task ID: {task_id}")
     log(f"full generation log: {log_path}")
-    with log_path.open("w", encoding="utf-8") as log_file:
-        result = subprocess.run(
-            command,
-            cwd=root,
-            stdout=log_file,
-            stderr=subprocess.STDOUT,
-            text=True,
-            check=False,
+    try:
+        with log_path.open("w", encoding="utf-8") as log_file:
+            result = subprocess.run(
+                command,
+                cwd=root,
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+                text=True,
+                check=False,
+            )
+    except OSError as exc:
+        error = f"video generation could not start: {exc}; log: {log_path}"
+        write_result_manifest(
+            root,
+            {
+                "status": "failed",
+                "subject": subject,
+                "task_id": task_id,
+                "task_dir": str(task_dir.resolve()),
+                "log_file": str(log_path.resolve()),
+                "video_files": [],
+                "error": error,
+            },
         )
+        raise SkillError(error) from exc
     if result.returncode != 0:
         tail = log_path.read_text(encoding="utf-8", errors="replace").splitlines()[-30:]
         if tail:
